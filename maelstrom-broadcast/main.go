@@ -4,17 +4,23 @@ import (
 	"encoding/json"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"log"
-	"sync"
 )
 
 func main() {
 	var valStore []float64
-	var mu sync.Mutex
+	valChan := make(chan float64)
 
 	n := maelstrom.NewNode()
 
+	go func() {
+		for {
+			v := <-valChan
+			valStore = append(valStore, v)
+		}
+	}()
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		return recvBroadcast(n, msg, &valStore, &mu)
+		return recvBroadcast(n, msg, valChan)
 	})
 	n.Handle("read", func(msg maelstrom.Message) error {
 		return readHandler(n, msg, valStore)
@@ -27,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	close(valChan)
 }
 
 func topologyHandler(n *maelstrom.Node, msg maelstrom.Message) error {
@@ -59,7 +65,7 @@ func readHandler(n *maelstrom.Node, msg maelstrom.Message, store []float64) erro
 	return nil
 }
 
-func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valStore *[]float64, mu *sync.Mutex) error {
+func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, ch chan float64) error {
 	body := map[string]any{}
 	err := json.Unmarshal(msg.Body, &body)
 	if err != nil {
@@ -68,9 +74,7 @@ func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valStore *[]float64
 
 	val := body["message"].(float64)
 
-	mu.Lock()
-	*valStore = append(*valStore, val)
-	mu.Unlock()
+	ch <- val
 
 	err = n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 	if err != nil {

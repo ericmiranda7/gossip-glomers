@@ -4,27 +4,25 @@ import (
 	"bytes"
 	"encoding/json"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	"sync"
 	"testing"
 )
 
 func TestRecvBroadcast(t *testing.T) {
 	n := maelstrom.NewNode()
-	var valStore []float64
 	jason, _ := json.Marshal(map[string]float64{"message": 1000})
-	mu := sync.Mutex{}
+	valChan := make(chan float64, 1)
 	msg := maelstrom.Message{
 		Src:  "src",
 		Dest: "dst",
 		Body: jason,
 	}
 
-	err := recvBroadcast(n, msg, &valStore, &mu)
+	err := recvBroadcast(n, msg, valChan)
 	if err != nil {
 		t.Fatal("wasn't expecting error")
 	}
 
-	if len(valStore) == 0 {
+	if v := <-valChan; v != 1000 {
 		t.Error("broadcast msg not saved!")
 	}
 }
