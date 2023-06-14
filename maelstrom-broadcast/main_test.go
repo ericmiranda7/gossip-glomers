@@ -17,7 +17,7 @@ func TestRecvBroadcast(t *testing.T) {
 		Body: jason,
 	}
 
-	err := recvBroadcast(n, msg, valChan)
+	err := recvBroadcast(n, msg, valChan, []string{"n0", "n1"})
 	if err != nil {
 		t.Fatal("wasn't expecting error")
 	}
@@ -32,6 +32,7 @@ func TestRead(t *testing.T) {
 	myStd := &bytes.Buffer{}
 	n.Stdout = myStd
 	valStore := []float64{2, 4, 6, 1}
+	store := msgStore{valStore: valStore}
 	jason, _ := json.Marshal(map[string]string{"type": "read"})
 	msg := maelstrom.Message{
 		Src:  "src",
@@ -39,7 +40,7 @@ func TestRead(t *testing.T) {
 		Body: jason,
 	}
 
-	err := readHandler(n, msg, valStore)
+	err := readHandler(n, msg, &store)
 	if err != nil {
 		t.Fatal("wasn't expecting error")
 	}

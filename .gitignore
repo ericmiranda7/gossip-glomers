@@ -23,4 +23,5 @@ go.work
 # maelstrom
 maelstrom/**
 maelstrom.*
-store/**
+**/store/**
+**/.idea/
