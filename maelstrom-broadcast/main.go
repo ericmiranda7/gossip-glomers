@@ -130,8 +130,10 @@ func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valChan chan float6
 	valChan <- val // send msg for storage
 
 	// notify neighbours
-	// todo(): don't send to src
 	for _, destNode := range neighbours {
+		if destNode == msg.Src {
+			continue
+		}
 		err := n.RPC(destNode, map[string]any{"type": "broadcast", "message": val, "mid": id}, func(msg maelstrom.Message) error {
 			body, err := extractBody(msg)
 			if err != nil {
