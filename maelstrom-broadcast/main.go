@@ -6,104 +6,144 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"log"
 	"sync"
+	"time"
 )
 
-type msgStore struct {
-	valStore []float64
-	mu       sync.Mutex
+type Server struct {
+	n              *maelstrom.Node
+	neighbourNodes []string
+	valStore       []float64
+	valChan        chan float64
+	msgChan        chan customMessage
+	msgQ           []customMessage
+	processedMsgs  []string
+	delMsgChan     chan string
+	mu             sync.Mutex
 }
 
-type Message struct {
+type topologyMsg struct {
+	Topology map[string][]string `json:"topology"`
+}
+
+type customMessage struct {
+	id   string
 	n    *maelstrom.Node
 	dest string
-	val  float64
+	val  any
 }
 
-func main() {
-	var msgStore msgStore
-	var neighbourNodes []string
-	var processedMsgs []string
-	valChan := make(chan float64)
-	retryChan := make(chan Message)
+func (s *Server) handle(t string, h func(message maelstrom.Message) error) {
+	s.n.Handle(t, h)
+}
 
-	n := maelstrom.NewNode()
-
+func (s *Server) start() {
 	// background housekeepers
 	go func() {
 		for {
 			select {
-			case v := <-valChan:
+			case v := <-s.valChan:
 				// msgStore updater
-				msgStore.mu.Lock()
-				msgStore.valStore = append(msgStore.valStore, v)
-				msgStore.mu.Unlock()
-			case m := <-retryChan:
-				// msg retrier
-				err := retryMessage(m, retryChan)
+				s.mu.Lock()
+				s.valStore = append(s.valStore, v)
+				s.mu.Unlock()
+			case m := <-s.msgChan:
+				// msg sender
+				s.msgQ = append(s.msgQ, m)
+				err := sendMessage(m, s.msgChan, s.delMsgChan)
 				if err != nil {
-					log.Println("some error on retry: ", err)
+					log.Println("some error on send: ", err)
+				}
+			case dm := <-s.delMsgChan:
+				delInd := -1
+				for i, e := range s.msgQ {
+					if e.id == dm {
+						delInd = i
+					}
+				}
+				if delInd == -1 {
+					break
+				}
+				s.msgQ[delInd] = s.msgQ[len(s.msgQ)-1]
+				s.msgQ = s.msgQ[:len(s.msgQ)-1]
+			}
+		}
+	}()
+	go func() {
+		for {
+			time.Sleep(time.Second * 5)
+			for _, m := range s.msgQ {
+				err := sendMessage(m, s.msgChan, s.delMsgChan)
+				if err != nil {
+					log.Println("some error on send: ", err)
 				}
 			}
 		}
 	}()
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		return recvBroadcast(n, msg, valChan, neighbourNodes, &processedMsgs, retryChan)
-	})
-	n.Handle("read", func(msg maelstrom.Message) error {
-		return readHandler(n, msg, &msgStore)
-	})
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		return topologyHandler(n, msg, &neighbourNodes)
-	})
-
-	err := n.Run()
+	err := s.n.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
-	close(valChan)
 }
 
-func topologyHandler(n *maelstrom.Node, msg maelstrom.Message, nodes *[]string) error {
-	body := map[string]any{}
+func NewServer(n *maelstrom.Node) *Server {
+	s := Server{
+		n:              n,
+		neighbourNodes: []string{},
+		valStore:       []float64{},
+		valChan:        make(chan float64),
+		msgChan:        make(chan customMessage),
+		msgQ:           []customMessage{},
+		processedMsgs:  []string{},
+		delMsgChan:     make(chan string),
+		mu:             sync.Mutex{},
+	}
+	return &s
+}
 
-	err := json.Unmarshal(msg.Body, &body)
+func main() {
+	n := maelstrom.NewNode()
+	s := NewServer(n)
+
+	s.n.Handle("broadcast", s.recvBroadcast)
+	s.n.Handle("read", s.readHandler)
+	s.handle("topology", s.topologyHandler)
+
+	s.start()
+
+}
+
+func (s *Server) topologyHandler(msg maelstrom.Message) error {
+	var tbody topologyMsg
+
+	err := json.Unmarshal(msg.Body, &tbody)
 	if err != nil {
 		return err
 	}
-	log.Println("bodice", body)
 
-	aInterfaces := body["topology"].(map[string]any)[n.ID()].([]any)
-	var strs []string
-	for _, s := range aInterfaces {
-		strs = append(strs, s.(string))
-	}
-	*nodes = strs
+	topology := tbody.Topology[s.n.ID()]
+	s.neighbourNodes = topology
 
-	err = n.Reply(msg, map[string]string{"type": "topology_ok"})
+	err = s.n.Reply(msg, map[string]string{"type": "topology_ok"})
 	if err != nil {
 		return err
 	}
 
-	log.Println("huks: ", *nodes)
 	return nil
 }
 
-func readHandler(n *maelstrom.Node, msg maelstrom.Message, store *msgStore) error {
+func (s *Server) readHandler(msg maelstrom.Message) error {
 	res := map[string]any{}
 	res["type"] = "read_ok"
-	store.mu.Lock()
-	res["messages"] = store.valStore
-	store.mu.Unlock()
+	// todo(): since its a slice the below isn't really copied
+	s.mu.Lock()
+	res["messages"] = s.valStore
+	s.mu.Unlock()
 
-	err := n.Reply(msg, res)
-	if err != nil {
-		return err
-	}
-	return nil
+	return s.n.Reply(msg, res)
 }
 
-func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valChan chan float64, neighbours []string, processedMsgs *[]string, retryChan chan Message) error {
+func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	body, err := extractBody(msg)
 	if err != nil {
 		return err
@@ -113,9 +153,9 @@ func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valChan chan float6
 	// if node src
 	if msg.Src[0] == 'n' {
 		id = body["mid"].(string)
-		for _, s := range *processedMsgs {
-			if s == id {
-				err = n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+		for _, pm := range s.processedMsgs {
+			if pm == id {
+				err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 				if err != nil {
 					return err
 				}
@@ -127,36 +167,24 @@ func recvBroadcast(n *maelstrom.Node, msg maelstrom.Message, valChan chan float6
 	}
 
 	val := body["message"].(float64)
-	valChan <- val // send msg for storage
+	s.valChan <- val // send msg for storage
 
 	// notify neighbours
-	for _, destNode := range neighbours {
+	for _, destNode := range s.neighbourNodes {
 		if destNode == msg.Src {
 			continue
 		}
-		err := n.RPC(destNode, map[string]any{"type": "broadcast", "message": val, "mid": id}, func(msg maelstrom.Message) error {
-			body, err := extractBody(msg)
-			if err != nil {
-				return err
-			}
-
-			if body["type"].(string) != "broadcast_ok" {
-				msgData := Message{
-					n:    n,
-					dest: destNode,
-					val:  val,
-				}
-				retryChan <- msgData
-			}
-			return nil
-		})
-		if err != nil {
-			return err
+		msgData := customMessage{
+			id:   id,
+			n:    s.n,
+			dest: destNode,
+			val:  map[string]any{"type": "broadcast", "message": val, "mid": id},
 		}
+		s.msgChan <- msgData
 	}
 
-	err = n.Reply(msg, map[string]string{"type": "broadcast_ok"})
-	*processedMsgs = append(*processedMsgs, id)
+	err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+	s.processedMsgs = append(s.processedMsgs, id)
 	if err != nil {
 		return err
 	}
@@ -172,7 +200,7 @@ func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	return body, nil
 }
 
-func retryMessage(msgData Message, retryChan chan Message) error {
+func sendMessage(msgData customMessage, sendMsgChan chan customMessage, delMsgChan chan string) error {
 	err := msgData.n.RPC(msgData.dest, msgData.val, func(msg maelstrom.Message) error {
 		body, err := extractBody(msg)
 		if err != nil {
@@ -180,8 +208,11 @@ func retryMessage(msgData Message, retryChan chan Message) error {
 		}
 
 		if body["type"].(string) != "broadcast_ok" {
-			retryChan <- msgData
+			sendMsgChan <- msgData
 		}
+
+		// todo(): del msg
+		delMsgChan <- msgData.id
 		return nil
 	})
 	if err != nil {
