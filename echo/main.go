@@ -9,17 +9,16 @@ import (
 func main() {
 	n := maelstrom.NewNode()
 
-	n.Handle("echo", func(msg maelstrom.Message) error {
-		// unmarshal into a loose map
+	n.Handle("echo", func(message maelstrom.Message) error {
 		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
+
+		if err := json.Unmarshal(message.Body, &body); err != nil {
 			return err
 		}
 
-		// update msg
 		body["type"] = "echo_ok"
 
-		return n.Reply(msg, body)
+		return n.Reply(message, body)
 	})
 
 	if err := n.Run(); err != nil {
