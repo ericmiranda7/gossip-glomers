@@ -1,7 +1,7 @@
 package main
 
-import "eric.com/gg/echo/v2"
+import "fmt"
 
 func main() {
-	echo.Echo()
+	fmt.Println("I'm root, look at my submodules for the relevant binaries.")
 }
