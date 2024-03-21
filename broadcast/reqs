@@ -1,0 +1,15 @@
+1. broadcast - store the msg
+2. read - send all stored msgs as response
+3. topology - for efficiency
+
+
+
+n1, n2, n3
+
+-> n1 -> 2 (n2, n3)
+-> n2 -> 2 (n1, n3)
+-> n3 -> 2 (n1, n2)
+
+[n1, n2] [n1, n3] [n3, n4]
+
+c -> n1 -> n2, n3
