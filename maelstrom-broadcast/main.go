@@ -49,6 +49,7 @@ func main() {
 	s.n.Handle("broadcast", s.recvBroadcast)
 	s.n.Handle("read", s.readHandler)
 	s.n.Handle("topology", s.topologyHandler)
+	s.n.Handle("broadcast_fine", s.broadcastOk)
 
 	s.start()
 }
@@ -66,11 +67,12 @@ func (s *Server) start() {
 			case m := <-s.msgChan:
 				// msg sender
 				s.msgQ = append(s.msgQ, m)
-				err := sendMessage(m, s.delMsgChan)
+				err := sendMessage(m)
 				if err != nil {
 					log.Println("some error on send: ", err)
 				}
 			case dm := <-s.delMsgChan:
+				// todo() make simple?
 				delInd := -1
 				for i, e := range s.msgQ {
 					if e.id == dm {
@@ -90,7 +92,7 @@ func (s *Server) start() {
 		for {
 			time.Sleep(time.Second * 5)
 			for _, m := range s.msgQ {
-				err := sendMessage(m, s.delMsgChan)
+				err := sendMessage(m)
 				if err != nil {
 					log.Println("some error on send: ", err)
 				}
@@ -116,11 +118,7 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		id = body["mid"].(string)
 		for _, pm := range s.processedMsgs {
 			if pm == id {
-				err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
-				if err != nil {
-					return err
-				}
-				return nil
+				return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 			}
 		}
 	} else {
@@ -144,11 +142,23 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		s.msgChan <- msgData
 	}
 
-	err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+	if msg.Src[0] == 'c' {
+		err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+	} else {
+		err = s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
+	}
 	s.processedMsgs = append(s.processedMsgs, id)
+	return err
+}
+
+func (s *Server) broadcastOk(msg maelstrom.Message) error {
+	body, err := extractBody(msg)
 	if err != nil {
 		return err
 	}
+
+	s.delMsgChan <- body["mid"].(string)
+
 	return nil
 }
 
@@ -191,11 +201,7 @@ func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	return body, nil
 }
 
-func sendMessage(msgData customMessage, delMsgChan chan string) error {
-	err := msgData.n.RPC(msgData.dest, msgData.val, func(msg maelstrom.Message) error {
-		// todo(): del msg
-		delMsgChan <- msgData.id
-		return nil
-	})
+func sendMessage(msgData customMessage) error {
+	err := msgData.n.Send(msgData.dest, msgData.val)
 	return err
 }
