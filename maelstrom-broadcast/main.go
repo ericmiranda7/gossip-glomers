@@ -32,8 +32,25 @@ type customMessage struct {
 	val  any
 }
 
-func (s *Server) handle(t string, h func(message maelstrom.Message) error) {
-	s.n.Handle(t, h)
+func main() {
+	n := maelstrom.NewNode()
+	s := Server{
+		n:              n,
+		neighbourNodes: []string{},
+		valStore:       []float64{},
+		valChan:        make(chan float64),
+		msgChan:        make(chan customMessage),
+		msgQ:           []customMessage{},
+		processedMsgs:  []string{},
+		delMsgChan:     make(chan string),
+		mu:             sync.Mutex{},
+	}
+
+	s.n.Handle("broadcast", s.recvBroadcast)
+	s.n.Handle("read", s.readHandler)
+	s.n.Handle("topology", s.topologyHandler)
+
+	s.start()
 }
 
 func (s *Server) start() {
@@ -49,7 +66,7 @@ func (s *Server) start() {
 			case m := <-s.msgChan:
 				// msg sender
 				s.msgQ = append(s.msgQ, m)
-				err := sendMessage(m, s.msgChan, s.delMsgChan)
+				err := sendMessage(m, s.delMsgChan)
 				if err != nil {
 					log.Println("some error on send: ", err)
 				}
@@ -68,11 +85,12 @@ func (s *Server) start() {
 			}
 		}
 	}()
+
 	go func() {
 		for {
 			time.Sleep(time.Second * 5)
 			for _, m := range s.msgQ {
-				err := sendMessage(m, s.msgChan, s.delMsgChan)
+				err := sendMessage(m, s.delMsgChan)
 				if err != nil {
 					log.Println("some error on send: ", err)
 				}
@@ -84,63 +102,6 @@ func (s *Server) start() {
 	if err != nil {
 		log.Fatal(err)
 	}
-}
-
-func NewServer(n *maelstrom.Node) *Server {
-	s := Server{
-		n:              n,
-		neighbourNodes: []string{},
-		valStore:       []float64{},
-		valChan:        make(chan float64),
-		msgChan:        make(chan customMessage),
-		msgQ:           []customMessage{},
-		processedMsgs:  []string{},
-		delMsgChan:     make(chan string),
-		mu:             sync.Mutex{},
-	}
-	return &s
-}
-
-func main() {
-	n := maelstrom.NewNode()
-	s := NewServer(n)
-
-	s.n.Handle("broadcast", s.recvBroadcast)
-	s.n.Handle("read", s.readHandler)
-	s.handle("topology", s.topologyHandler)
-
-	s.start()
-
-}
-
-func (s *Server) topologyHandler(msg maelstrom.Message) error {
-	var tbody topologyMsg
-
-	err := json.Unmarshal(msg.Body, &tbody)
-	if err != nil {
-		return err
-	}
-
-	topology := tbody.Topology[s.n.ID()]
-	s.neighbourNodes = topology
-
-	err = s.n.Reply(msg, map[string]string{"type": "topology_ok"})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *Server) readHandler(msg maelstrom.Message) error {
-	res := map[string]any{}
-	res["type"] = "read_ok"
-	// todo(): since its a slice the below isn't really copied
-	s.mu.Lock()
-	res["messages"] = s.valStore
-	s.mu.Unlock()
-
-	return s.n.Reply(msg, res)
 }
 
 func (s *Server) recvBroadcast(msg maelstrom.Message) error {
@@ -191,6 +152,36 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	return nil
 }
 
+func (s *Server) topologyHandler(msg maelstrom.Message) error {
+	var tbody topologyMsg
+
+	err := json.Unmarshal(msg.Body, &tbody)
+	if err != nil {
+		return err
+	}
+
+	topology := tbody.Topology[s.n.ID()]
+	s.neighbourNodes = topology
+
+	err = s.n.Reply(msg, map[string]string{"type": "topology_ok"})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) readHandler(msg maelstrom.Message) error {
+	res := map[string]any{}
+	res["type"] = "read_ok"
+	// todo(): since its a slice the below isn't really copied
+	s.mu.Lock()
+	res["messages"] = s.valStore
+	s.mu.Unlock()
+
+	return s.n.Reply(msg, res)
+}
+
 func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	body := map[string]any{}
 	err := json.Unmarshal(msg.Body, &body)
@@ -200,23 +191,11 @@ func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	return body, nil
 }
 
-func sendMessage(msgData customMessage, sendMsgChan chan customMessage, delMsgChan chan string) error {
+func sendMessage(msgData customMessage, delMsgChan chan string) error {
 	err := msgData.n.RPC(msgData.dest, msgData.val, func(msg maelstrom.Message) error {
-		body, err := extractBody(msg)
-		if err != nil {
-			return err
-		}
-
-		if body["type"].(string) != "broadcast_ok" {
-			sendMsgChan <- msgData
-		}
-
 		// todo(): del msg
 		delMsgChan <- msgData.id
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
