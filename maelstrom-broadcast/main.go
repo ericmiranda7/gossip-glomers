@@ -15,7 +15,7 @@ type Server struct {
 	valStore       []float64
 	valChan        chan float64
 	msgChan        chan customMessage
-	msgQ           []customMessage
+	msgQ           map[string]customMessage
 	processedMsgs  []string
 	delMsgChan     chan string
 	mu             sync.Mutex
@@ -40,7 +40,7 @@ func main() {
 		valStore:       []float64{},
 		valChan:        make(chan float64),
 		msgChan:        make(chan customMessage),
-		msgQ:           []customMessage{},
+		msgQ:           make(map[string]customMessage),
 		processedMsgs:  []string{},
 		delMsgChan:     make(chan string),
 		mu:             sync.Mutex{},
@@ -51,58 +51,48 @@ func main() {
 	s.n.Handle("topology", s.topologyHandler)
 	s.n.Handle("broadcast_fine", s.broadcastOk)
 
-	s.start()
-}
-
-func (s *Server) start() {
 	// background housekeepers
-	go func() {
-		for {
-			select {
-			case v := <-s.valChan:
-				// msgStore updater
-				s.mu.Lock()
-				s.valStore = append(s.valStore, v)
-				s.mu.Unlock()
-			case m := <-s.msgChan:
-				// msg sender
-				s.msgQ = append(s.msgQ, m)
-				err := sendMessage(m)
-				if err != nil {
-					log.Println("some error on send: ", err)
-				}
-			case dm := <-s.delMsgChan:
-				// todo() make simple?
-				delInd := -1
-				for i, e := range s.msgQ {
-					if e.id == dm {
-						delInd = i
-					}
-				}
-				if delInd == -1 {
-					break
-				}
-				s.msgQ[delInd] = s.msgQ[len(s.msgQ)-1]
-				s.msgQ = s.msgQ[:len(s.msgQ)-1]
-			}
-		}
-	}()
+	go s.handleMessages()
 
-	go func() {
-		for {
-			time.Sleep(time.Second * 5)
-			for _, m := range s.msgQ {
-				err := sendMessage(m)
-				if err != nil {
-					log.Println("some error on send: ", err)
-				}
-			}
-		}
-	}()
+	go s.retryMechanism()
 
 	err := s.n.Run()
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+func (s *Server) retryMechanism() {
+	// TODO(): the below code is erroneous, shift from an infinite for to goroutine per message
+	for {
+		time.Sleep(time.Second * 5)
+		for _, m := range s.msgQ {
+			err := sendMessage(m)
+			if err != nil {
+				log.Println("some error on send: ", err)
+			}
+		}
+	}
+}
+
+func (s *Server) handleMessages() {
+	for {
+		select {
+		case v := <-s.valChan:
+			// msgStore updater
+			s.mu.Lock()
+			s.valStore = append(s.valStore, v)
+			s.mu.Unlock()
+		case m := <-s.msgChan:
+			// msg sender
+			s.msgQ[m.id] = m
+			err := sendMessage(m)
+			if err != nil {
+				log.Println("some error on send: ", err)
+			}
+		case dm := <-s.delMsgChan:
+			delete(s.msgQ, dm)
+		}
 	}
 }
 
