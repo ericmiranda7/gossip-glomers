@@ -16,7 +16,7 @@ type Server struct {
 	valChan        chan float64
 	msgChan        chan customMessage
 	msgQ           map[string]customMessage
-	processedMsgs  []string
+	processedMsgs  map[string]bool
 	delMsgChan     chan string
 	mu             sync.Mutex
 }
@@ -41,7 +41,7 @@ func main() {
 		valChan:        make(chan float64),
 		msgChan:        make(chan customMessage),
 		msgQ:           make(map[string]customMessage),
-		processedMsgs:  []string{},
+		processedMsgs:  make(map[string]bool),
 		delMsgChan:     make(chan string),
 		mu:             sync.Mutex{},
 	}
@@ -106,10 +106,11 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	// if node src
 	if msg.Src[0] == 'n' {
 		id = body["mid"].(string)
-		for _, pm := range s.processedMsgs {
-			if pm == id {
-				return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
-			}
+		s.mu.Lock()
+		_, ok := s.processedMsgs[id]
+		s.mu.Unlock()
+		if ok {
+			return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 		}
 	} else {
 		id = uuid.NewString()
@@ -137,7 +138,9 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	} else {
 		err = s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 	}
-	s.processedMsgs = append(s.processedMsgs, id)
+	s.mu.Lock()
+	s.processedMsgs[id] = true
+	s.mu.Unlock()
 	return err
 }
 
