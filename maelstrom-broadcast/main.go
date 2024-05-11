@@ -17,7 +17,6 @@ type Server struct {
 	msgChan        chan customMessage
 	msgQ           map[string]customMessage
 	processedMsgs  map[string]bool
-	delMsgChan     chan string
 	mu             sync.Mutex
 }
 
@@ -41,7 +40,6 @@ func main() {
 		msgChan:        make(chan customMessage),
 		msgQ:           make(map[string]customMessage),
 		processedMsgs:  make(map[string]bool),
-		delMsgChan:     make(chan string),
 		mu:             sync.Mutex{},
 	}
 
@@ -51,7 +49,7 @@ func main() {
 	s.n.Handle("read", s.readHandler)
 
 	// node handlers
-	s.n.Handle("broadcast_fine", s.broadcastOk)
+	s.n.Handle("broadcast_fine", s.neighbourNotified)
 
 	// background housekeepers
 	go s.processMessages()
@@ -69,7 +67,7 @@ func (s *Server) retryMechanism() {
 	for {
 		time.Sleep(time.Second * 5)
 		for _, m := range s.msgQ {
-			sendMessage(m)
+			rpcMessage(m, s.neighbourNotified)
 		}
 	}
 }
@@ -84,10 +82,10 @@ func (s *Server) processMessages() {
 			s.mu.Unlock()
 		case m := <-s.msgChan:
 			// msg sender
+			s.mu.Lock()
 			s.msgQ[m.id] = m
-			sendMessage(m)
-		case dm := <-s.delMsgChan:
-			delete(s.msgQ, dm)
+			s.mu.Unlock()
+			rpcMessage(m, s.neighbourNotified)
 		}
 	}
 }
@@ -123,13 +121,12 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		if destNode == msg.Src {
 			continue
 		}
-		msgData := customMessage{
+		s.msgChan <- customMessage{
 			id:   id,
 			n:    s.n,
 			dest: destNode,
 			val:  map[string]any{"type": "broadcast", "message": val, "mid": id},
 		}
-		s.msgChan <- msgData
 	}
 
 	if msg.Src[0] == 'c' {
@@ -143,14 +140,16 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	return err
 }
 
-func (s *Server) broadcastOk(msg maelstrom.Message) error {
+func (s *Server) neighbourNotified(msg maelstrom.Message) error {
 	body, err := extractBody(msg)
 	if err != nil {
 		return err
 	}
 
-	s.delMsgChan <- body["mid"].(string)
-
+	// todo(): each resource with own mu?
+	s.mu.Lock()
+	delete(s.msgQ, body["mid"].(string))
+	s.mu.Unlock()
 	return nil
 }
 
@@ -176,10 +175,8 @@ func (s *Server) topologyHandler(msg maelstrom.Message) error {
 func (s *Server) readHandler(msg maelstrom.Message) error {
 	res := map[string]any{}
 	res["type"] = "read_ok"
-	// todo(): since its a slice the below isn't really copied
-	s.mu.Lock()
+	// mu not needed since valStore is appended always
 	res["messages"] = s.valStore
-	s.mu.Unlock()
 
 	return s.n.Reply(msg, res)
 }
@@ -193,8 +190,8 @@ func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	return body, nil
 }
 
-func sendMessage(msgData customMessage) {
-	err := msgData.n.Send(msgData.dest, msgData.val)
+func rpcMessage(msgData customMessage, resHandler maelstrom.HandlerFunc) {
+	err := msgData.n.RPC(msgData.dest, msgData.val, resHandler)
 	if err != nil {
 		log.Println("some error on send: ", err)
 	}
