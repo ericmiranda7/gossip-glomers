@@ -33,9 +33,8 @@ type customMessage struct {
 }
 
 func main() {
-	n := maelstrom.NewNode()
 	s := Server{
-		n:              n,
+		n:              maelstrom.NewNode(),
 		neighbourNodes: []string{},
 		valStore:       []float64{},
 		valChan:        make(chan float64),
@@ -46,13 +45,16 @@ func main() {
 		mu:             sync.Mutex{},
 	}
 
+	// client handlers
+	s.n.Handle("topology", s.topologyHandler)
 	s.n.Handle("broadcast", s.recvBroadcast)
 	s.n.Handle("read", s.readHandler)
-	s.n.Handle("topology", s.topologyHandler)
+
+	// node handlers
 	s.n.Handle("broadcast_fine", s.broadcastOk)
 
 	// background housekeepers
-	go s.handleMessages()
+	go s.processMessages()
 
 	go s.retryMechanism()
 
@@ -67,15 +69,12 @@ func (s *Server) retryMechanism() {
 	for {
 		time.Sleep(time.Second * 5)
 		for _, m := range s.msgQ {
-			err := sendMessage(m)
-			if err != nil {
-				log.Println("some error on send: ", err)
-			}
+			sendMessage(m)
 		}
 	}
 }
 
-func (s *Server) handleMessages() {
+func (s *Server) processMessages() {
 	for {
 		select {
 		case v := <-s.valChan:
@@ -86,10 +85,7 @@ func (s *Server) handleMessages() {
 		case m := <-s.msgChan:
 			// msg sender
 			s.msgQ[m.id] = m
-			err := sendMessage(m)
-			if err != nil {
-				log.Println("some error on send: ", err)
-			}
+			sendMessage(m)
 		case dm := <-s.delMsgChan:
 			delete(s.msgQ, dm)
 		}
@@ -103,8 +99,9 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	}
 
 	var id string
-	// if node src
-	if msg.Src[0] == 'n' {
+	switch msg.Src[0] {
+	case 'n':
+		// if node src
 		id = body["mid"].(string)
 		s.mu.Lock()
 		_, ok := s.processedMsgs[id]
@@ -112,7 +109,9 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		if ok {
 			return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 		}
-	} else {
+		break
+	case 'c':
+		// if client src
 		id = uuid.NewString()
 	}
 
@@ -194,7 +193,9 @@ func extractBody(msg maelstrom.Message) (map[string]any, error) {
 	return body, nil
 }
 
-func sendMessage(msgData customMessage) error {
+func sendMessage(msgData customMessage) {
 	err := msgData.n.Send(msgData.dest, msgData.val)
-	return err
+	if err != nil {
+		log.Println("some error on send: ", err)
+	}
 }
