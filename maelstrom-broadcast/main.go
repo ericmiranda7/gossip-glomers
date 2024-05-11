@@ -25,10 +25,11 @@ type topologyMsg struct {
 }
 
 type customMessage struct {
-	id   string
-	n    *maelstrom.Node
-	dest string
-	val  any
+	id         string
+	n          *maelstrom.Node
+	dest       string
+	val        any
+	alreadyGot []string
 }
 
 func main() {
@@ -102,15 +103,16 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		// if node src
 		id = body["mid"].(string)
 		s.mu.Lock()
-		_, ok := s.processedMsgs[id]
+		_, processed := s.processedMsgs[id]
 		s.mu.Unlock()
-		if ok {
+		if processed {
 			return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 		}
 		break
 	case 'c':
 		// if client src
 		id = uuid.NewString()
+		err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 	}
 
 	val := body["message"].(float64)
@@ -122,18 +124,14 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 			continue
 		}
 		s.msgChan <- customMessage{
-			id:   id,
-			n:    s.n,
-			dest: destNode,
-			val:  map[string]any{"type": "broadcast", "message": val, "mid": id},
+			id:         id,
+			n:          s.n,
+			dest:       destNode,
+			val:        map[string]any{"type": "broadcast", "message": val, "mid": id},
+			alreadyGot: []string{s.n.ID()},
 		}
 	}
 
-	if msg.Src[0] == 'c' {
-		err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
-	} else {
-		err = s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
-	}
 	s.mu.Lock()
 	s.processedMsgs[id] = true
 	s.mu.Unlock()
