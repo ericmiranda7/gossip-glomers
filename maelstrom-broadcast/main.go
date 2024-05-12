@@ -15,7 +15,7 @@ type Server struct {
 	valStore       []int
 	valChan        chan int
 	msgChan        chan customMessage
-	msgQ           map[string]map[string]customMessage
+	msgQ           map[string]map[string]customMessage // node_id -> (msg_id -> customMessage) eg. n4 -> [mid1, mid4]
 	processedMsgs  map[string]bool
 	mu             sync.Mutex
 }
