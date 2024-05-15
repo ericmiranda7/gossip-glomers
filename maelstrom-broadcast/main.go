@@ -17,7 +17,9 @@ type Server struct {
 	msgChan        chan customMessage
 	notifMap       map[string]map[string]customMessage // node_id -> (msg_id -> customMessage) eg. n4 -> [mid1, mid4]
 	processedMsgs  map[string]bool
-	mu             sync.Mutex
+	msgMapMutex    sync.Mutex
+	valStoreMutex  sync.Mutex
+	processedMu    sync.Mutex
 }
 
 type topologyMsg struct {
@@ -44,11 +46,13 @@ func main() {
 		n:              maelstrom.NewNode(),
 		neighbourNodes: []string{},
 		valStore:       []int{},
-		valChan:        make(chan int),
-		msgChan:        make(chan customMessage),
+		valChan:        make(chan int, 10000),
+		msgChan:        make(chan customMessage, 10000),
 		notifMap:       make(map[string]map[string]customMessage), // node_id -> (msg_id -> message) todo(): is nested map necessary? just use array indexed by node id
 		processedMsgs:  make(map[string]bool),
-		mu:             sync.Mutex{},
+		msgMapMutex:    sync.Mutex{},
+		valStoreMutex:  sync.Mutex{},
+		processedMu:    sync.Mutex{},
 	}
 
 	// client handlers
@@ -70,8 +74,8 @@ func main() {
 func (s *Server) retryMechanism() {
 	// TODO(): the below code is erroneous, shift from an infinite for to goroutine per message
 	for {
-		time.Sleep(time.Second * 5)
-		s.mu.Lock()
+		time.Sleep(time.Second * 8)
+		s.msgMapMutex.Lock()
 
 		for _, msgMap := range s.notifMap {
 			for _, msg := range msgMap {
@@ -79,7 +83,7 @@ func (s *Server) retryMechanism() {
 			}
 		}
 
-		s.mu.Unlock()
+		s.msgMapMutex.Unlock()
 	}
 }
 
@@ -88,19 +92,19 @@ func (s *Server) processMessages() {
 		select {
 		case v := <-s.valChan:
 			// msgStore updater
-			s.mu.Lock()
+			s.valStoreMutex.Lock()
 			s.valStore = append(s.valStore, v)
-			s.mu.Unlock()
+			s.valStoreMutex.Unlock()
 		case m := <-s.msgChan:
 			// msg sender
-			s.mu.Lock()
+			s.msgMapMutex.Lock()
 
-			if _, exists := s.notifMap[m.n.ID()]; !exists {
-				s.notifMap[m.n.ID()] = make(map[string]customMessage) // msg_id -> message
+			if _, exists := s.notifMap[m.dest]; !exists {
+				s.notifMap[m.dest] = make(map[string]customMessage) // msg_id -> message
 			}
-			s.notifMap[m.n.ID()][m.id] = m
+			s.notifMap[m.dest][m.id] = m
 
-			s.mu.Unlock()
+			s.msgMapMutex.Unlock()
 			rpcMessage(m, s.neighbourNotifiedCallback)
 		}
 	}
@@ -115,23 +119,20 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	var needToSendTo []string
 
 	var id string
-	log.Println("MSGSRC IS", msg.Src, msg.Src[0])
 	switch msg.Src[0] {
 	case 'n':
 		// if node src
 		id = body.Mid
-		s.mu.Lock()
+		s.processedMu.Lock()
 		_, processed := s.processedMsgs[id]
-		s.mu.Unlock()
+		s.processedMu.Unlock()
 		if processed {
-			log.Println("m true")
 			// avoid duplicates
 			// if its already been processed, means its already been sent to my neighbours. no need to propagate
 			return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 		}
 
 		for _, n := range s.neighbourNodes {
-			log.Println("alreadyNotified:", body.AlreadyGot[n], n)
 			if _, alreadyNotified := body.AlreadyGot[n]; !alreadyNotified && n != msg.Src {
 				needToSendTo = append(needToSendTo, n)
 			}
@@ -139,23 +140,19 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 	case 'c':
 		// if client src
 		id = uuid.NewString()
-		for _, n := range s.neighbourNodes {
-			if n != msg.Src {
-				needToSendTo = append(needToSendTo, n)
-			}
-		}
+		needToSendTo = append(needToSendTo, s.neighbourNodes...)
 		err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 	}
 
 	val := body.Message
 	s.valChan <- val // send msg for storage
+	s.processedMu.Lock()
+	s.processedMsgs[id] = true
+	s.processedMu.Unlock()
 	body.AlreadyGot[s.n.ID()] = true
 
 	s.notifyNeighbours(needToSendTo, body, id, val)
 
-	s.mu.Lock()
-	s.processedMsgs[id] = true
-	s.mu.Unlock()
 	return err
 }
 
@@ -165,7 +162,6 @@ func (s *Server) notifyNeighbours(needToSendTo []string, body *messageBody, id s
 		body.AlreadyGot[destNode] = true
 	}
 
-	log.Println("I NEED TO SEND TO", needToSendTo)
 	for _, destNode := range needToSendTo {
 		s.msgChan <- customMessage{
 			id:      id,
@@ -175,6 +171,7 @@ func (s *Server) notifyNeighbours(needToSendTo []string, body *messageBody, id s
 		}
 	}
 }
+
 func (s *Server) topologyHandler(msg maelstrom.Message) error {
 	var tbody topologyMsg
 
@@ -209,14 +206,15 @@ func (s *Server) neighbourNotifiedCallback(msg maelstrom.Message) error {
 		return err
 	}
 
-	// todo(): each resource with own mu?
-	s.mu.Lock()
+	s.msgMapMutex.Lock()
 
-	for _, msgMap := range s.notifMap {
-		delete(msgMap, body.Mid)
+	for nodeId, msgMap := range s.notifMap {
+		if msg.Src == nodeId {
+			delete(msgMap, body.Mid)
+		}
 	}
 
-	s.mu.Unlock()
+	s.msgMapMutex.Unlock()
 	return nil
 }
 
