@@ -97,17 +97,24 @@ func (s *Server) processMessages() {
 			s.valStoreMutex.Unlock()
 		case m := <-s.msgChan:
 			// msg sender
-			s.msgMapMutex.Lock()
-
-			if _, exists := s.notifMap[m.dest]; !exists {
-				s.notifMap[m.dest] = make(map[string]customMessage) // msg_id -> message
-			}
-			s.notifMap[m.dest][m.id] = m
-
-			s.msgMapMutex.Unlock()
-			rpcMessage(m, s.neighbourNotifiedCallback)
+			//s.msgMapMutex.Lock()
+			//
+			//if _, exists := s.notifMap[m.dest]; !exists {
+			//	s.notifMap[m.dest] = make(map[string]customMessage) // msg_id -> message
+			//}
+			//s.notifMap[m.dest][m.id] = m
+			//
+			//s.msgMapMutex.Unlock()
+			//rpcMessage(m, s.neighbourNotifiedCallback)
+			go s.neighbourNotifier(m)
 		}
 	}
+}
+
+func (s *Server) neighbourNotifier(msg customMessage) {
+	// sync RPC with timeout
+	s.n.SyncRPC(nil, msg.dest, msg.msgBody)
+	// once timeout, retry (simply add msg to msgChan)
 }
 
 func (s *Server) recvBroadcast(msg maelstrom.Message) error {
@@ -124,6 +131,7 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		// if node src
 		id = body.Mid
 		s.processedMu.Lock()
+		// todo(): maybe set to true earlier to avoid duplicates?
 		_, processed := s.processedMsgs[id]
 		s.processedMu.Unlock()
 		if processed {
