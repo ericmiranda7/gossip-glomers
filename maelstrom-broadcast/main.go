@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"github.com/google/uuid"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -15,10 +16,7 @@ type Server struct {
 	valStore       []int
 	valChan        chan int
 	msgChan        chan customMessage
-	notifMap       map[string]map[string]customMessage // node_id -> (msg_id -> customMessage) eg. n4 -> [mid1, mid4]
 	processedMsgs  map[string]bool
-	msgMapMutex    sync.Mutex
-	valStoreMutex  sync.Mutex
 	processedMu    sync.Mutex
 }
 
@@ -48,10 +46,7 @@ func main() {
 		valStore:       []int{},
 		valChan:        make(chan int, 10000),
 		msgChan:        make(chan customMessage, 10000),
-		notifMap:       make(map[string]map[string]customMessage), // node_id -> (msg_id -> message) todo(): is nested map necessary? just use array indexed by node id
 		processedMsgs:  make(map[string]bool),
-		msgMapMutex:    sync.Mutex{},
-		valStoreMutex:  sync.Mutex{},
 		processedMu:    sync.Mutex{},
 	}
 
@@ -63,27 +58,9 @@ func main() {
 	// background housekeepers
 	go s.processMessages()
 
-	go s.retryMechanism()
-
 	err := s.n.Run()
 	if err != nil {
 		log.Fatal(err)
-	}
-}
-
-func (s *Server) retryMechanism() {
-	// TODO(): the below code is erroneous, shift from an infinite for to goroutine per message
-	for {
-		time.Sleep(time.Second * 8)
-		s.msgMapMutex.Lock()
-
-		for _, msgMap := range s.notifMap {
-			for _, msg := range msgMap {
-				rpcMessage(msg, s.neighbourNotifiedCallback)
-			}
-		}
-
-		s.msgMapMutex.Unlock()
 	}
 }
 
@@ -92,29 +69,22 @@ func (s *Server) processMessages() {
 		select {
 		case v := <-s.valChan:
 			// msgStore updater
-			s.valStoreMutex.Lock()
+			log.Println("ADDED", v)
 			s.valStore = append(s.valStore, v)
-			s.valStoreMutex.Unlock()
 		case m := <-s.msgChan:
-			// msg sender
-			//s.msgMapMutex.Lock()
-			//
-			//if _, exists := s.notifMap[m.dest]; !exists {
-			//	s.notifMap[m.dest] = make(map[string]customMessage) // msg_id -> message
-			//}
-			//s.notifMap[m.dest][m.id] = m
-			//
-			//s.msgMapMutex.Unlock()
-			//rpcMessage(m, s.neighbourNotifiedCallback)
 			go s.neighbourNotifier(m)
 		}
 	}
 }
 
 func (s *Server) neighbourNotifier(msg customMessage) {
-	// sync RPC with timeout
-	s.n.SyncRPC(nil, msg.dest, msg.msgBody)
-	// once timeout, retry (simply add msg to msgChan)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*2))
+	_, err := s.n.SyncRPC(ctx, msg.dest, msg.msgBody)
+	if err != nil {
+		log.Println("Some error", err)
+		go s.neighbourNotifier(msg)
+	}
+	cancel()
 }
 
 func (s *Server) recvBroadcast(msg maelstrom.Message) error {
@@ -131,17 +101,20 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		// if node src
 		id = body.Mid
 		s.processedMu.Lock()
-		// todo(): maybe set to true earlier to avoid duplicates?
-		_, processed := s.processedMsgs[id]
+		processed := s.processedMsgs[id]
 		s.processedMu.Unlock()
 		if processed {
-			// avoid duplicates
-			// if its already been processed, means its already been sent to my neighbours. no need to propagate
+			log.Println("already processed", id, body.Message)
 			return s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
 		}
 
+		err := s.n.Reply(msg, map[string]string{"type": "broadcast_fine", "mid": id})
+		if err != nil {
+			return err
+		}
+
 		for _, n := range s.neighbourNodes {
-			if _, alreadyNotified := body.AlreadyGot[n]; !alreadyNotified && n != msg.Src {
+			if alreadyNotified := body.AlreadyGot[n]; !alreadyNotified && n != msg.Src {
 				needToSendTo = append(needToSendTo, n)
 			}
 		}
@@ -150,21 +123,27 @@ func (s *Server) recvBroadcast(msg maelstrom.Message) error {
 		id = uuid.NewString()
 		needToSendTo = append(needToSendTo, s.neighbourNodes...)
 		err = s.n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+		if err != nil {
+			return err
+		}
 	}
-
-	val := body.Message
-	s.valChan <- val // send msg for storage
 	s.processedMu.Lock()
 	s.processedMsgs[id] = true
 	s.processedMu.Unlock()
+
+	log.Println("GOT", id, body.Message)
+	s.valChan <- body.Message // send msg for storage
+
 	body.AlreadyGot[s.n.ID()] = true
+	body.Mid = id
 
-	s.notifyNeighbours(needToSendTo, body, id, val)
+	s.notifyNeighbours(needToSendTo, body)
+	body.Mid = id
 
-	return err
+	return nil
 }
 
-func (s *Server) notifyNeighbours(needToSendTo []string, body *messageBody, id string, val int) {
+func (s *Server) notifyNeighbours(needToSendTo []string, body *messageBody) {
 	// build notified nodes map
 	for _, destNode := range needToSendTo {
 		body.AlreadyGot[destNode] = true
@@ -172,10 +151,10 @@ func (s *Server) notifyNeighbours(needToSendTo []string, body *messageBody, id s
 
 	for _, destNode := range needToSendTo {
 		s.msgChan <- customMessage{
-			id:      id,
+			id:      body.Mid,
 			n:       s.n,
 			dest:    destNode,
-			msgBody: messageBody{MsgType: "broadcast", Message: val, Mid: id, AlreadyGot: body.AlreadyGot},
+			msgBody: messageBody{MsgType: "broadcast", Message: body.Message, Mid: body.Mid, AlreadyGot: body.AlreadyGot},
 		}
 	}
 }
@@ -206,31 +185,6 @@ func (s *Server) readHandler(msg maelstrom.Message) error {
 	res["messages"] = s.valStore
 
 	return s.n.Reply(msg, res)
-}
-
-func (s *Server) neighbourNotifiedCallback(msg maelstrom.Message) error {
-	body, err := extractBody(msg)
-	if err != nil {
-		return err
-	}
-
-	s.msgMapMutex.Lock()
-
-	for nodeId, msgMap := range s.notifMap {
-		if msg.Src == nodeId {
-			delete(msgMap, body.Mid)
-		}
-	}
-
-	s.msgMapMutex.Unlock()
-	return nil
-}
-
-func rpcMessage(msgData customMessage, resHandler maelstrom.HandlerFunc) {
-	err := msgData.n.RPC(msgData.dest, msgData.msgBody, resHandler)
-	if err != nil {
-		log.Println("some error on send: ", err)
-	}
 }
 
 func extractBody(msg maelstrom.Message) (*messageBody, error) {
