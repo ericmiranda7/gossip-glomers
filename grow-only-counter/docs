@@ -1,0 +1,5 @@
+ALGO
+1. maintain an in-memory counter per node
+2. synchronise access to the in-memory counter (so that node's goroutines don't get stale values)
+3. store the in-memory counter in a key pertaining to that specific node
+4. at every read, nodes perform a read on every key in the KV and adds it together
